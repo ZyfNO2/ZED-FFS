@@ -191,13 +191,14 @@ class FFSInference:
     @torch.no_grad()
     def infer(self, left_img: np.ndarray, right_img: np.ndarray,
               scale: float = 0.5, valid_iters: int = 8,
-              min_depth: float = 0.5, max_depth: float = 15.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+              min_depth: float = 0.5, max_depth: float = 15.0,
+              depth_edge_threshold: float = 0.1) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Returns: (disparity, depth, xyz_map_in_camera_coords)
 
-        Filtering: removes points outside min_depth..max_depth range to prevent
-        conical/radial artifacts caused by unreliable disparity at close range
-        (disparity too large) and far range (disparity too small / tiny quantisation error).
+        Filtering:
+        1. Removes points outside min_depth..max_depth range
+        2. Removes points at depth discontinuities (object edges)
         """
         if scale != 1.0:
             left_img = cv2.resize(left_img, fx=scale, fy=scale, dsize=None)
@@ -231,9 +232,22 @@ class FFSInference:
         disp_clean = disp.copy()
         disp_clean[combined_invalid] = np.inf
 
-        depth = (K_scaled[0, 0] * self.baseline / disp_clean).astype(np.float32)
-        depth[depth < 0.05] = 0
-        depth[depth > max_depth] = 0
+        depth_raw = (K_scaled[0, 0] * self.baseline / disp_clean).astype(np.float32)
+        depth_raw[depth_raw < min_depth] = 0
+        depth_raw[depth_raw > max_depth] = 0
+
+        if depth_edge_threshold > 0:
+            sobel_x = cv2.Sobel(depth_raw, cv2.CV_32F, 1, 0, ksize=3)
+            sobel_y = cv2.Sobel(depth_raw, cv2.CV_32F, 0, 1, ksize=3)
+            grad_mag = np.sqrt(sobel_x**2 + sobel_y**2)
+            valid_depth_mask = depth_raw > 0.05
+            rel_grad = np.zeros_like(depth_raw)
+            np.divide(grad_mag, depth_raw, out=rel_grad, where=valid_depth_mask)
+            edge_mask = (rel_grad > depth_edge_threshold) & valid_depth_mask
+            combined_invalid = combined_invalid | edge_mask
+
+        depth = depth_raw.copy()
+        depth[combined_invalid] = 0
 
         xyz_map = depth2xyzmap(depth, K_scaled)
         return disp, depth, xyz_map
@@ -251,7 +265,9 @@ class PointCloudFuser:
                  radius_nb_points: int = 10, radius_radius: float = 0.05,
                  dbscan_eps: float = 0.08, dbscan_min_pts: int = 15,
                  cone_n_theta: int = 36, cone_n_phi: int = 18,
-                 cone_count_ratio: float = 3.0, cone_discard_outer_ratio: float = 0.5):
+                 cone_count_ratio: float = 3.0, cone_discard_outer_ratio: float = 0.5,
+                 temporal_warmup_frames: int = 5,
+                 temporal_min_half_frames: int = 2):
         self.voxel_size = voxel_size
         self.nb_neighbors = nb_neighbors
         self.std_ratio = std_ratio
@@ -265,8 +281,11 @@ class PointCloudFuser:
         self.cone_n_phi = cone_n_phi
         self.cone_count_ratio = cone_count_ratio
         self.cone_discard_outer_ratio = cone_discard_outer_ratio
+        self.temporal_warmup_frames = temporal_warmup_frames
+        self.temporal_min_half_frames = temporal_min_half_frames
         self.all_points = []
         self.all_colors = []
+        self.bin_temporal = {}
 
     def add_frame(self, xyz_map: np.ndarray, color_img: np.ndarray,
                   pose_4x4: np.ndarray, valid_depth_range: Tuple[float, float] = (0.1, 100.0)):
@@ -306,6 +325,16 @@ class PointCloudFuser:
         self.all_points.append(pts_world)
         self.all_colors.append(colors)
 
+        bin_size = self.voxel_size * self.sparse_bin_factor
+        bin_keys = ((pts_world[:, 0] / bin_size).astype(np.int64) |
+                    (pts_world[:, 1] / bin_size).astype(np.int64) << 10 |
+                    (pts_world[:, 2] / bin_size).astype(np.int64) << 20)
+        frame_idx = len(self.all_points) - 1
+        for bk in np.unique(bin_keys):
+            if bk not in self.bin_temporal:
+                self.bin_temporal[bk] = set()
+            self.bin_temporal[bk].add(frame_idx)
+
     def process_and_save(self, output_path: str) -> o3d.geometry.PointCloud:
         """Merge, sparse filter, downsample, three-stage denoise, save PLY"""
         if len(self.all_points) == 0:
@@ -325,6 +354,34 @@ class PointCloudFuser:
         all_pts = all_pts[keep_mask]
         all_clr = all_clr[keep_mask]
         logging.info(f"Sparse filter: removed {(~keep_mask).sum()} noise points, kept {len(all_pts)}")
+
+        valid_keys = valid_bins & set(self.bin_temporal.keys())
+        bin_keys_filtered = ((all_pts[:, 0] / bin_size).astype(np.int64) |
+                            (all_pts[:, 1] / bin_size).astype(np.int64) << 10 |
+                            (all_pts[:, 2] / bin_size).astype(np.int64) << 20)
+        n_frames = len(self.all_points)
+        mid_point = self.temporal_warmup_frames
+        before_half = set(range(0, mid_point))
+        after_half = set(range(mid_point, n_frames))
+
+        temporal_keep = []
+        for k in bin_keys_filtered:
+            if k not in valid_keys:
+                temporal_keep.append(False)
+                continue
+            frames_seen = self.bin_temporal.get(k, set())
+            before_count = len(frames_seen & before_half)
+            after_count = len(frames_seen & after_half)
+            if before_count >= self.temporal_min_half_frames and after_count >= self.temporal_min_half_frames:
+                temporal_keep.append(True)
+            else:
+                temporal_keep.append(False)
+
+        temporal_keep_mask = np.array(temporal_keep)
+        pts_temporal_removed = (~temporal_keep_mask).sum()
+        all_pts = all_pts[temporal_keep_mask]
+        all_clr = all_clr[temporal_keep_mask]
+        logging.info(f"Temporal filter (warmup={self.temporal_warmup_frames}, min_half={self.temporal_min_half_frames}): removed {pts_temporal_removed} noise points, kept {len(all_pts)}")
 
         pcd = toOpen3dCloud(all_pts, all_clr)
         orig_len = len(pcd.points)
@@ -451,12 +508,18 @@ Examples:
                        help='Minimum valid depth in meters (default: 0.5)')
     parser.add_argument('--max_depth', type=float, default=15.0,
                        help='Maximum valid depth in meters (default: 15.0)')
+    parser.add_argument('--depth_edge_threshold', type=float, default=0.1,
+                       help='Relative depth gradient threshold for edge filtering (default: 0.1, 0 to disable)')
     parser.add_argument('--voxel_size', type=float, default=0.02,
                        help='Voxel downsample size in meters (default: 0.02)')
     parser.add_argument('--min_pts_per_bin', type=int, default=3,
                        help='Min points per spatial bin for sparse filtering (default: 3)')
     parser.add_argument('--sparse_bin_factor', type=float, default=2.0,
                        help='Spatial bin size = voxel_size * this (default: 2.0)')
+    parser.add_argument('--temporal_warmup_frames', type=int, default=5,
+                       help='Number of warmup frames before temporal filtering starts (default: 5)')
+    parser.add_argument('--temporal_min_half_frames', type=int, default=2,
+                       help='Min frames a bin must appear in both halves to keep (default: 2)')
     parser.add_argument('--nb_neighbors', type=int, default=100,
                        help='Statistical outlier removal k-nearest neighbors (default: 100)')
     parser.add_argument('--std_ratio', type=float, default=1.0,
@@ -492,8 +555,6 @@ Examples:
         return
 
     output_dir = args.output or os.path.join(code_dir, 'output')
-    if os.path.exists(output_dir):
-        shutil.rmtree(output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
     t_start = time.time()
@@ -522,6 +583,8 @@ Examples:
                 cone_n_phi=args.cone_n_phi,
                 cone_count_ratio=args.cone_count_ratio,
                 cone_discard_outer_ratio=args.cone_discard_outer_ratio,
+                temporal_warmup_frames=args.temporal_warmup_frames,
+                temporal_min_half_frames=args.temporal_min_half_frames,
             )
 
             gen = reader.stream_frames(frame_skip=args.frame_skip, max_ok_frames=args.max_ok_frames)
@@ -530,7 +593,8 @@ Examples:
                 disp, depth, xyz = ffs.infer(left, right, scale=args.scale,
                                              valid_iters=args.valid_iters,
                                              min_depth=args.min_depth,
-                                             max_depth=args.max_depth)
+                                             max_depth=args.max_depth,
+                                             depth_edge_threshold=args.depth_edge_threshold)
                 if args.scale != 1.0:
                     left_scaled = cv2.resize(left, fx=args.scale, fy=args.scale, dsize=None)
                 else:
