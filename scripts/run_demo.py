@@ -43,8 +43,18 @@ if __name__=="__main__":
   set_logging_format()
   set_seed(0)
   torch.autograd.set_grad_enabled(False)
+  
+  # Disable dynamo completely to avoid Triton dependency issues
+  import torch
+  torch.backends.cudnn.benchmark = True
+  # Set environment variables to disable dynamo
+  import os
+  os.environ['TORCHDYNAMO_DISABLE'] = '1'
 
-  os.system(f'rm -rf {args.out_dir} && mkdir -p {args.out_dir}')
+  import shutil
+  if os.path.exists(args.out_dir):
+    shutil.rmtree(args.out_dir)
+  os.makedirs(args.out_dir, exist_ok=True)
 
   with open(f'{os.path.dirname(args.model_dir)}/cfg.yaml', 'r') as ff:
     cfg:dict = yaml.safe_load(ff)
