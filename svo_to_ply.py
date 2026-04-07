@@ -2,6 +2,13 @@
 """
 ZED SVO -> PLY Point Cloud Reconstruction using Fast-FoundationStereo
 
+Recommended Parameters (Best Quality):
+    python svo_to_ply.py --svo "path/to/your.svo2" \\
+        --depth_edge_threshold 0.01 \\
+        --temporal_warmup_frames 0 --temporal_min_half_frames 1 \\
+        --nb_neighbors 100 --std_ratio 0.2 \\
+        --minimal_filtering
+
 Usage:
     python svo_to_ply.py --svo "path/to/your.svo2"
     python svo_to_ply.py --svo "path/to/your.svo2" --scale 0.5 --frame_skip 5
@@ -267,7 +274,9 @@ class PointCloudFuser:
                  cone_n_theta: int = 36, cone_n_phi: int = 18,
                  cone_count_ratio: float = 3.0, cone_discard_outer_ratio: float = 0.5,
                  temporal_warmup_frames: int = 5,
-                 temporal_min_half_frames: int = 2):
+                 temporal_min_half_frames: int = 2,
+                 skip_dbscan: bool = False,
+                 minimal_filtering: bool = False):
         self.voxel_size = voxel_size
         self.nb_neighbors = nb_neighbors
         self.std_ratio = std_ratio
@@ -283,6 +292,8 @@ class PointCloudFuser:
         self.cone_discard_outer_ratio = cone_discard_outer_ratio
         self.temporal_warmup_frames = temporal_warmup_frames
         self.temporal_min_half_frames = temporal_min_half_frames
+        self.skip_dbscan = skip_dbscan
+        self.minimal_filtering = minimal_filtering
         self.all_points = []
         self.all_colors = []
         self.bin_temporal = {}
@@ -340,6 +351,12 @@ class PointCloudFuser:
         if len(self.all_points) == 0:
             raise ValueError("No points to fuse")
 
+        # Helper function to save intermediate results
+        def save_intermediate(pcd, step_name, step_num):
+            intermediate_path = output_path.replace('.ply', f'_{step_num:02d}_{step_name}.ply')
+            o3d.io.write_point_cloud(intermediate_path, pcd)
+            logging.info(f"Intermediate saved [{step_num}]: {intermediate_path} ({len(pcd.points)} points)")
+
         all_pts = np.vstack(self.all_points)
         all_clr = np.vstack(self.all_colors)
         logging.info(f"Fusing {len(all_pts)} raw points from {len(self.all_points)} frames")
@@ -355,27 +372,44 @@ class PointCloudFuser:
         all_clr = all_clr[keep_mask]
         logging.info(f"Sparse filter: removed {(~keep_mask).sum()} noise points, kept {len(all_pts)}")
 
+        # Save after sparse filter
+        pcd_sparse = toOpen3dCloud(all_pts, all_clr)
+        save_intermediate(pcd_sparse, 'sparse', 1)
+
         valid_keys = valid_bins & set(self.bin_temporal.keys())
         bin_keys_filtered = ((all_pts[:, 0] / bin_size).astype(np.int64) |
                             (all_pts[:, 1] / bin_size).astype(np.int64) << 10 |
                             (all_pts[:, 2] / bin_size).astype(np.int64) << 20)
         n_frames = len(self.all_points)
         mid_point = self.temporal_warmup_frames
-        before_half = set(range(0, mid_point))
-        after_half = set(range(mid_point, n_frames))
 
         temporal_keep = []
-        for k in bin_keys_filtered:
-            if k not in valid_keys:
-                temporal_keep.append(False)
-                continue
-            frames_seen = self.bin_temporal.get(k, set())
-            before_count = len(frames_seen & before_half)
-            after_count = len(frames_seen & after_half)
-            if before_count >= self.temporal_min_half_frames and after_count >= self.temporal_min_half_frames:
-                temporal_keep.append(True)
+        if mid_point == 0 or self.temporal_min_half_frames == 0:
+            if self.temporal_min_half_frames == 0 or n_frames == 0:
+                for k in bin_keys_filtered:
+                    temporal_keep.append(k in valid_keys)
             else:
-                temporal_keep.append(False)
+                for k in bin_keys_filtered:
+                    if k not in valid_keys:
+                        temporal_keep.append(False)
+                        continue
+                    frames_seen = self.bin_temporal.get(k, set())
+                    after_count = len(frames_seen)
+                    temporal_keep.append(after_count >= self.temporal_min_half_frames)
+        else:
+            before_half = set(range(0, mid_point))
+            after_half = set(range(mid_point, n_frames))
+            for k in bin_keys_filtered:
+                if k not in valid_keys:
+                    temporal_keep.append(False)
+                    continue
+                frames_seen = self.bin_temporal.get(k, set())
+                before_count = len(frames_seen & before_half)
+                after_count = len(frames_seen & after_half)
+                if before_count >= self.temporal_min_half_frames and after_count >= self.temporal_min_half_frames:
+                    temporal_keep.append(True)
+                else:
+                    temporal_keep.append(False)
 
         temporal_keep_mask = np.array(temporal_keep)
         pts_temporal_removed = (~temporal_keep_mask).sum()
@@ -383,47 +417,109 @@ class PointCloudFuser:
         all_clr = all_clr[temporal_keep_mask]
         logging.info(f"Temporal filter (warmup={self.temporal_warmup_frames}, min_half={self.temporal_min_half_frames}): removed {pts_temporal_removed} noise points, kept {len(all_pts)}")
 
-        pcd = toOpen3dCloud(all_pts, all_clr)
-        orig_len = len(pcd.points)
+        # Save after temporal filter
+        pcd_temporal = toOpen3dCloud(all_pts, all_clr)
+        save_intermediate(pcd_temporal, 'temporal', 2)
 
-        pcd = pcd.voxel_down_sample(voxel_size=self.voxel_size)
-        after_voxel = len(pcd.points)
-        logging.info(f"Voxel downsample: {orig_len} -> {after_voxel}")
+        if self.minimal_filtering:
+            logging.info("Minimal filtering mode: skipping voxel, keeping statistical/radius/DBSCAN")
+            pcd = pcd_temporal
+            after_voxel = len(pcd.points)
 
-        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=self.nb_neighbors,
-                                                std_ratio=self.std_ratio)
-        after_stat = len(pcd.points)
-        logging.info(f"Statistical outlier removal (k={self.nb_neighbors}, std={self.std_ratio}): {after_voxel} -> {after_stat}")
+            pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=self.nb_neighbors,
+                                                    std_ratio=self.std_ratio)
+            after_stat = len(pcd.points)
+            logging.info(f"Statistical outlier removal (k={self.nb_neighbors}, std={self.std_ratio}): {after_voxel} -> {after_stat}")
+            save_intermediate(pcd, 'statistical', 3)
 
-        cl, ind = pcd.remove_radius_outlier(nb_points=self.radius_nb_points,
-                                            radius=self.radius_radius)
-        pcd = cl
-        after_radius = len(pcd.points)
-        logging.info(f"Radius outlier removal (nb={self.radius_nb_points}, r={self.radius_radius}): {after_stat} -> {after_radius}")
+            cl, ind = pcd.remove_radius_outlier(nb_points=self.radius_nb_points,
+                                                radius=self.radius_radius)
+            pcd = cl
+            after_radius = len(pcd.points)
+            logging.info(f"Radius outlier removal (nb={self.radius_nb_points}, r={self.radius_radius}): {after_stat} -> {after_radius}")
+            save_intermediate(pcd, 'radius', 4)
 
-        with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error):
-            labels = np.array(pcd.cluster_dbscan(eps=self.dbscan_eps,
-                                                  min_points=self.dbscan_min_pts,
-                                                  print_progress=False))
-        if len(labels) > 0:
-            max_label = labels.max()
-            cluster_sizes = [(labels == i).sum() for i in range(max_label + 1)]
-            valid_mask = labels >= 0
-            for i, sz in enumerate(cluster_sizes):
-                if sz < self.dbscan_min_pts:
-                    valid_mask[labels == i] = False
-            pcd = pcd.select_by_index(np.where(valid_mask)[0])
-            after_dbscan = len(pcd.points)
-            logging.info(f"DBSCAN clustering (eps={self.dbscan_eps}, min_pts={self.dbscan_min_pts}): {after_radius} -> {after_dbscan} (kept {max_label+1} clusters)")
+            with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error):
+                labels = np.array(pcd.cluster_dbscan(eps=self.dbscan_eps,
+                                                      min_points=self.dbscan_min_pts,
+                                                      print_progress=False))
+            if len(labels) > 0:
+                max_label = labels.max()
+                cluster_sizes = [(labels == i).sum() for i in range(max_label + 1)]
+                valid_mask = labels >= 0
+                for i, sz in enumerate(cluster_sizes):
+                    if sz < self.dbscan_min_pts:
+                        valid_mask[labels == i] = False
+                pcd = pcd.select_by_index(np.where(valid_mask)[0])
+                after_dbscan = len(pcd.points)
+                logging.info(f"DBSCAN clustering (eps={self.dbscan_eps}, min_pts={self.dbscan_min_pts}): {after_radius} -> {after_dbscan} (kept {max_label+1} clusters)")
+            else:
+                logging.warning("DBSCAN returned no labels, skipping cluster filter")
+                after_dbscan = after_radius
+            save_intermediate(pcd, 'dbscan', 5)
+            after_cone = after_dbscan
         else:
-            logging.warning("DBSCAN returned no labels, skipping cluster filter")
+            pcd = pcd_temporal
+            orig_len = len(pcd.points)
 
-        pts = np.asarray(pcd.points)
-        valid_mask = self._detect_conical_artifacts(pts)
-        removed_cone = (~valid_mask).sum()
-        pcd = pcd.select_by_index(np.where(valid_mask)[0])
-        after_cone = len(pcd.points)
-        logging.info(f"Conical artifact removal (theta={self.cone_n_theta}, phi={self.cone_n_phi}, ratio={self.cone_count_ratio}): {after_dbscan} -> {after_cone} (removed {removed_cone})")
+            pcd = pcd.voxel_down_sample(voxel_size=self.voxel_size)
+            after_voxel = len(pcd.points)
+            logging.info(f"Voxel downsample: {orig_len} -> {after_voxel}")
+
+            # Save after voxel downsample
+            save_intermediate(pcd, 'voxel', 3)
+
+            pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=self.nb_neighbors,
+                                                    std_ratio=self.std_ratio)
+            after_stat = len(pcd.points)
+            logging.info(f"Statistical outlier removal (k={self.nb_neighbors}, std={self.std_ratio}): {after_voxel} -> {after_stat}")
+
+            # Save after statistical outlier removal
+            save_intermediate(pcd, 'statistical', 4)
+
+            cl, ind = pcd.remove_radius_outlier(nb_points=self.radius_nb_points,
+                                                radius=self.radius_radius)
+            pcd = cl
+            after_radius = len(pcd.points)
+            logging.info(f"Radius outlier removal (nb={self.radius_nb_points}, r={self.radius_radius}): {after_stat} -> {after_radius}")
+
+            # Save after radius outlier removal
+            save_intermediate(pcd, 'radius', 5)
+
+            if self.skip_dbscan:
+                logging.info("DBSCAN skipped by user")
+                after_dbscan = after_radius
+            else:
+                with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error):
+                    labels = np.array(pcd.cluster_dbscan(eps=self.dbscan_eps,
+                                                          min_points=self.dbscan_min_pts,
+                                                          print_progress=False))
+                if len(labels) > 0:
+                    max_label = labels.max()
+                    cluster_sizes = [(labels == i).sum() for i in range(max_label + 1)]
+                    valid_mask = labels >= 0
+                    for i, sz in enumerate(cluster_sizes):
+                        if sz < self.dbscan_min_pts:
+                            valid_mask[labels == i] = False
+                    pcd = pcd.select_by_index(np.where(valid_mask)[0])
+                    after_dbscan = len(pcd.points)
+                    logging.info(f"DBSCAN clustering (eps={self.dbscan_eps}, min_pts={self.dbscan_min_pts}): {after_radius} -> {after_dbscan} (kept {max_label+1} clusters)")
+                else:
+                    logging.warning("DBSCAN returned no labels, skipping cluster filter")
+                    after_dbscan = after_radius
+
+            # Save after DBSCAN clustering
+            save_intermediate(pcd, 'dbscan', 6)
+
+            pts = np.asarray(pcd.points)
+            valid_mask = self._detect_conical_artifacts(pts)
+            removed_cone = (~valid_mask).sum()
+            pcd = pcd.select_by_index(np.where(valid_mask)[0])
+            after_cone = len(pcd.points)
+            logging.info(f"Conical artifact removal (theta={self.cone_n_theta}, phi={self.cone_n_phi}, ratio={self.cone_count_ratio}): {after_dbscan} -> {after_cone} (removed {removed_cone})")
+
+            # Save after conical artifact removal (final intermediate)
+            save_intermediate(pcd, 'conical', 7)
 
         o3d.io.write_point_cloud(output_path, pcd)
         logging.info(f"Saved: {output_path}")
@@ -520,10 +616,14 @@ Examples:
                        help='Number of warmup frames before temporal filtering starts (default: 5)')
     parser.add_argument('--temporal_min_half_frames', type=int, default=2,
                        help='Min frames a bin must appear in both halves to keep (default: 2)')
+    parser.add_argument('--skip_dbscan', action='store_true',
+                       help='Skip DBSCAN clustering step')
+    parser.add_argument('--minimal_filtering', action='store_true',
+                       help='Skip voxel/statistical/radius/DBSCAN/conical, only minimal filtering')
     parser.add_argument('--nb_neighbors', type=int, default=100,
                        help='Statistical outlier removal k-nearest neighbors (default: 100)')
-    parser.add_argument('--std_ratio', type=float, default=1.0,
-                       help='Statistical outlier removal std ratio threshold (default: 1.0)')
+    parser.add_argument('--std_ratio', type=float, default=0.2,
+                       help='Statistical outlier removal std ratio threshold (default: 0.2)')
     parser.add_argument('--radius_nb_points', type=int, default=10,
                        help='Radius outlier removal min neighbors in sphere (default: 10)')
     parser.add_argument('--radius_radius', type=float, default=0.05,
@@ -585,6 +685,8 @@ Examples:
                 cone_discard_outer_ratio=args.cone_discard_outer_ratio,
                 temporal_warmup_frames=args.temporal_warmup_frames,
                 temporal_min_half_frames=args.temporal_min_half_frames,
+                skip_dbscan=args.skip_dbscan,
+                minimal_filtering=args.minimal_filtering,
             )
 
             gen = reader.stream_frames(frame_skip=args.frame_skip, max_ok_frames=args.max_ok_frames)
