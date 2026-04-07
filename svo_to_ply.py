@@ -92,8 +92,8 @@ class SVOReader:
         if self.zed is not None:
             self.zed.close()
 
-    def stream_frames(self, frame_skip: int = 5) -> Generator[Tuple[np.ndarray, np.ndarray, np.ndarray], None, None]:
-        """Yield (left_rgb, right_rgb, pose_4x4) for each frame"""
+    def stream_frames(self, frame_skip: int = 5, max_ok_frames: int = 5) -> Generator[Tuple[np.ndarray, np.ndarray, np.ndarray], None, None]:
+        """Yield (left_rgb, right_rgb, pose_4x4) for each frame with valid pose tracking"""
         runtime = sl.RuntimeParameters()
         runtime.confidence_threshold = 50
         left_mat = sl.Mat()
@@ -101,26 +101,37 @@ class SVOReader:
         pose = sl.Pose()
         frame_count = 0
         yielded = 0
+        ok_frames = 0
+        bad_frames = 0
+        first_ok_captured = []
 
         while True:
+            frame_count += 1
+
             grab_result = self.zed.grab(runtime)
             if grab_result == sl.ERROR_CODE.END_OF_SVOFILE_REACHED:
                 break
             if grab_result != sl.ERROR_CODE.SUCCESS:
-                frame_count += 1
                 continue
 
-            if frame_count % (frame_skip + 1) != 0:
-                frame_count += 1
+            if (frame_count - 1) % (frame_skip + 1) != 0:
                 continue
 
             self.zed.retrieve_image(left_mat, sl.VIEW.LEFT)
             self.zed.retrieve_image(right_mat, sl.VIEW.RIGHT)
-            self.zed.get_position(pose)
+            err = self.zed.get_position(pose)
+            if err == sl.POSITIONAL_TRACKING_STATE.OK:
+                ok_frames += 1
+                if len(first_ok_captured) < max_ok_frames:
+                    first_ok_captured.append(frame_count)
+            else:
+                bad_frames += 1
+                continue
+
+            pose_data = pose.pose_data()
 
             left_img = left_mat.get_data().copy()
             right_img = right_mat.get_data().copy()
-            pose_data = pose.pose_data()
             if hasattr(pose_data, 'to_matrix'):
                 pose_matrix = np.array(pose_data.to_matrix(), dtype=np.float64)
             elif hasattr(pose_data, 'm'):
@@ -149,9 +160,14 @@ class SVOReader:
 
             yielded += 1
             yield left_img, right_img, pose_matrix
-            frame_count += 1
 
-        logging.info(f"Total frames scanned: {frame_count}, yielded: {yielded}")
+            if yielded >= max_ok_frames:
+                logging.info(f"Captured {max_ok_frames} OK frames, stopping early")
+                break
+
+        if first_ok_captured:
+            logging.info(f"First OK frames at indices: {first_ok_captured}")
+        logging.info(f"EXITING GENERATOR: Total frames scanned: {frame_count}, yielded: {yielded} (OK:{ok_frames}, bad:{bad_frames})")
 
 
 class FFSInference:
@@ -229,14 +245,26 @@ import yaml
 class PointCloudFuser:
     """Multi-frame point cloud fusion with pose transform"""
 
-    def __init__(self, voxel_size: float = 0.02, nb_neighbors: int = 50,
-                 std_ratio: float = 1.5, sparse_bin_factor: float = 2.0,
-                 min_pts_per_bin: int = 3):
+    def __init__(self, voxel_size: float = 0.02, nb_neighbors: int = 100,
+                 std_ratio: float = 1.0, sparse_bin_factor: float = 2.0,
+                 min_pts_per_bin: int = 3,
+                 radius_nb_points: int = 10, radius_radius: float = 0.05,
+                 dbscan_eps: float = 0.08, dbscan_min_pts: int = 15,
+                 cone_n_theta: int = 36, cone_n_phi: int = 18,
+                 cone_count_ratio: float = 3.0, cone_discard_outer_ratio: float = 0.5):
         self.voxel_size = voxel_size
         self.nb_neighbors = nb_neighbors
         self.std_ratio = std_ratio
         self.sparse_bin_factor = sparse_bin_factor
         self.min_pts_per_bin = min_pts_per_bin
+        self.radius_nb_points = radius_nb_points
+        self.radius_radius = radius_radius
+        self.dbscan_eps = dbscan_eps
+        self.dbscan_min_pts = dbscan_min_pts
+        self.cone_n_theta = cone_n_theta
+        self.cone_n_phi = cone_n_phi
+        self.cone_count_ratio = cone_count_ratio
+        self.cone_discard_outer_ratio = cone_discard_outer_ratio
         self.all_points = []
         self.all_colors = []
 
@@ -279,7 +307,7 @@ class PointCloudFuser:
         self.all_colors.append(colors)
 
     def process_and_save(self, output_path: str) -> o3d.geometry.PointCloud:
-        """Merge, sparse filter, downsample, denoise, save PLY"""
+        """Merge, sparse filter, downsample, three-stage denoise, save PLY"""
         if len(self.all_points) == 0:
             raise ValueError("No points to fuse")
 
@@ -303,15 +331,96 @@ class PointCloudFuser:
 
         pcd = pcd.voxel_down_sample(voxel_size=self.voxel_size)
         after_voxel = len(pcd.points)
+        logging.info(f"Voxel downsample: {orig_len} -> {after_voxel}")
 
         pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=self.nb_neighbors,
                                                 std_ratio=self.std_ratio)
-        final_len = len(pcd.points)
+        after_stat = len(pcd.points)
+        logging.info(f"Statistical outlier removal (k={self.nb_neighbors}, std={self.std_ratio}): {after_voxel} -> {after_stat}")
+
+        cl, ind = pcd.remove_radius_outlier(nb_points=self.radius_nb_points,
+                                            radius=self.radius_radius)
+        pcd = cl
+        after_radius = len(pcd.points)
+        logging.info(f"Radius outlier removal (nb={self.radius_nb_points}, r={self.radius_radius}): {after_stat} -> {after_radius}")
+
+        with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error):
+            labels = np.array(pcd.cluster_dbscan(eps=self.dbscan_eps,
+                                                  min_points=self.dbscan_min_pts,
+                                                  print_progress=False))
+        if len(labels) > 0:
+            max_label = labels.max()
+            cluster_sizes = [(labels == i).sum() for i in range(max_label + 1)]
+            valid_mask = labels >= 0
+            for i, sz in enumerate(cluster_sizes):
+                if sz < self.dbscan_min_pts:
+                    valid_mask[labels == i] = False
+            pcd = pcd.select_by_index(np.where(valid_mask)[0])
+            after_dbscan = len(pcd.points)
+            logging.info(f"DBSCAN clustering (eps={self.dbscan_eps}, min_pts={self.dbscan_min_pts}): {after_radius} -> {after_dbscan} (kept {max_label+1} clusters)")
+        else:
+            logging.warning("DBSCAN returned no labels, skipping cluster filter")
+
+        pts = np.asarray(pcd.points)
+        valid_mask = self._detect_conical_artifacts(pts)
+        removed_cone = (~valid_mask).sum()
+        pcd = pcd.select_by_index(np.where(valid_mask)[0])
+        after_cone = len(pcd.points)
+        logging.info(f"Conical artifact removal (theta={self.cone_n_theta}, phi={self.cone_n_phi}, ratio={self.cone_count_ratio}): {after_dbscan} -> {after_cone} (removed {removed_cone})")
 
         o3d.io.write_point_cloud(output_path, pcd)
         logging.info(f"Saved: {output_path}")
-        logging.info(f"Points: {orig_len} -> {after_voxel} (voxel) -> {final_len} (outlier)")
+        logging.info(f"Final point cloud: {len(pcd.points)} points")
         return pcd
+
+    def _detect_conical_artifacts(self, points: np.ndarray) -> np.ndarray:
+        """Detect and remove conical/radial artifacts.
+
+        These artifacts form cone/funnel shapes emanating from the origin:
+        - dense near the camera, sparse far away
+        - appear as planes/sheets extending from near to far
+        Detection: in each (theta, phi) direction, if inner-count >> outer-count,
+        the outer points in that direction are marked as conical noise.
+        """
+        vectors = points
+        distances = np.linalg.norm(vectors, axis=1)
+
+        d_min = np.percentile(distances, 2)
+        d_max = np.percentile(distances, 98)
+        if d_max <= d_min:
+            return np.ones(len(points), dtype=bool)
+
+        d_median = np.median(distances)
+        inner_mask = distances <= d_median
+
+        theta = np.arctan2(vectors[:, 1], vectors[:, 0])
+        phi = np.arccos(np.clip(vectors[:, 2] / np.maximum(distances, 1e-6), -1, 1))
+
+        theta_bins = np.linspace(-np.pi, np.pi, self.cone_n_theta + 1)
+        phi_bins = np.linspace(0, np.pi, self.cone_n_phi + 1)
+
+        ti = np.clip(np.digitize(theta, theta_bins) - 1, 0, self.cone_n_theta - 1)
+        pi = np.clip(np.digitize(phi, phi_bins) - 1, 0, self.cone_n_phi - 1)
+
+        inner_counts = np.zeros((self.cone_n_theta, self.cone_n_phi), dtype=np.int32)
+        outer_counts = np.zeros((self.cone_n_theta, self.cone_n_phi), dtype=np.int32)
+        np.add.at(inner_counts, (ti[inner_mask], pi[inner_mask]), 1)
+        np.add.at(outer_counts, (ti[~inner_mask], pi[~inner_mask]), 1)
+
+        ratio = (inner_counts.astype(float) + 1.0) / (outer_counts.astype(float) + 1.0)
+
+        valid = np.ones(len(points), dtype=bool)
+        discard_outer = int(self.cone_discard_outer_ratio * self.cone_n_theta) or 1
+        discard_start = self.cone_n_theta - discard_outer
+
+        for idx in range(len(points)):
+            if inner_mask[idx]:
+                continue
+            ti_bin = ti[idx]
+            if ti_bin >= discard_start and ratio[ti_bin, pi[idx]] > self.cone_count_ratio:
+                valid[idx] = False
+
+        return valid
 
 
 def main():
@@ -336,6 +445,8 @@ Examples:
                        help='Refinement iterations (default: 8)')
     parser.add_argument('--frame_skip', type=int, default=5,
                        help='Frames to skip between processed frames (default: 5)')
+    parser.add_argument('--max_ok_frames', type=int, default=5,
+                       help='Max frames with OK pose tracking to process (default: 5)')
     parser.add_argument('--min_depth', type=float, default=0.5,
                        help='Minimum valid depth in meters (default: 0.5)')
     parser.add_argument('--max_depth', type=float, default=15.0,
@@ -346,6 +457,26 @@ Examples:
                        help='Min points per spatial bin for sparse filtering (default: 3)')
     parser.add_argument('--sparse_bin_factor', type=float, default=2.0,
                        help='Spatial bin size = voxel_size * this (default: 2.0)')
+    parser.add_argument('--nb_neighbors', type=int, default=100,
+                       help='Statistical outlier removal k-nearest neighbors (default: 100)')
+    parser.add_argument('--std_ratio', type=float, default=1.0,
+                       help='Statistical outlier removal std ratio threshold (default: 1.0)')
+    parser.add_argument('--radius_nb_points', type=int, default=10,
+                       help='Radius outlier removal min neighbors in sphere (default: 10)')
+    parser.add_argument('--radius_radius', type=float, default=0.05,
+                       help='Radius outlier removal sphere radius in meters (default: 0.05)')
+    parser.add_argument('--dbscan_eps', type=float, default=0.08,
+                       help='DBSCAN cluster epsilon distance in meters (default: 0.08)')
+    parser.add_argument('--dbscan_min_pts', type=int, default=15,
+                       help='DBSCAN minimum points per cluster (default: 15)')
+    parser.add_argument('--cone_n_theta', type=int, default=36,
+                       help='Conical detection theta bins (default: 36)')
+    parser.add_argument('--cone_n_phi', type=int, default=18,
+                       help='Conical detection phi bins (default: 18)')
+    parser.add_argument('--cone_count_ratio', type=float, default=3.0,
+                       help='Conical detection inner/outer count ratio threshold (default: 3.0)')
+    parser.add_argument('--cone_discard_outer_ratio', type=float, default=0.5,
+                       help='Fraction of outer theta bins to check for conical artifacts (default: 0.5)')
     args = parser.parse_args()
 
     set_logging_format()
@@ -379,13 +510,22 @@ Examples:
             ffs.baseline = reader.baseline
             fuser = PointCloudFuser(
                 voxel_size=args.voxel_size,
-                nb_neighbors=50,
-                std_ratio=1.5,
+                nb_neighbors=args.nb_neighbors,
+                std_ratio=args.std_ratio,
                 min_pts_per_bin=args.min_pts_per_bin,
                 sparse_bin_factor=args.sparse_bin_factor,
+                radius_nb_points=args.radius_nb_points,
+                radius_radius=args.radius_radius,
+                dbscan_eps=args.dbscan_eps,
+                dbscan_min_pts=args.dbscan_min_pts,
+                cone_n_theta=args.cone_n_theta,
+                cone_n_phi=args.cone_n_phi,
+                cone_count_ratio=args.cone_count_ratio,
+                cone_discard_outer_ratio=args.cone_discard_outer_ratio,
             )
 
-            for idx, (left, right, pose) in enumerate(reader.stream_frames(frame_skip=args.frame_skip)):
+            gen = reader.stream_frames(frame_skip=args.frame_skip, max_ok_frames=args.max_ok_frames)
+            for idx, (left, right, pose) in enumerate(gen):
                 t_frame = time.time()
                 disp, depth, xyz = ffs.infer(left, right, scale=args.scale,
                                              valid_iters=args.valid_iters,
