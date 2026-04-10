@@ -1,6 +1,6 @@
 # ZED SVO → PLY 点云重建工具
 
-基于 [Fast-FoundationStereo](https://github.com/NVLabs/Fast-FoundationStereo) 的 ZED 相机 SVO 文件转 PLY 点云重建工具。
+基于 [Fast-FoundationStereo](https://github.com/NVLabs/Fast-FoundationStereo) 的 ZED 相机 SVO 文件转 PLY 点云重建工具，支持**置信度分析**与**多级滤波**。
 
 ## 效果预览
 
@@ -12,6 +12,10 @@
 
 - **SVO 文件读取**：直接从 ZED SVO 文件提取左右目图像、相机内参、外参（位姿矩阵）
 - **深度估计**：使用 Fast-FoundationStereo 零样本立体匹配模型推理深度图
+- **置信度分析与可视化**：
+  - 置信度彩色点云生成（白=高置信度，灰=低置信度）
+  - Open3D 交互式置信度滑块查看器
+  - Gradio Web 界面实时调节置信度阈值并预览滤波效果
 - **坐标转换**：自动处理 OpenCV 坐标系与 ZED 坐标系的转换
 - **多级滤波**：
   - 深度边缘滤波（去除物体边缘不可靠点）
@@ -73,9 +77,42 @@ python filter_ply.py "output/your_svo_02_temporal.ply" --stat_std 0.2
 
 | 文件 | 说明 |
 |------|------|
-| `svo_to_ply.py` | 主程序：SVO 转 PLY |
+| `svo_to_ply.py` | 主程序：SVO 转 PLY（含置信度数据导出） |
 | `filter_ply.py` | 辅助工具：对已有PLY文件施加不同滤波参数 |
+| `generate_confidence_colored_ply.py` | 置信度可视化：生成灰度彩色点云（白=高置信度） |
+| `open3d_conf_viewer.py` | Open3D 交互式查看器：滑块调节置信度阈值实时过滤点云 |
+| `confidence_slider_app.py` | Gradio Web 应用：浏览器中交互式调节置信度阈值并预览滤波效果 |
 | `output/` | 输出目录，包含中间PLY文件 |
+
+## 置信度工具使用
+
+### 1. 生成置信度彩色点云
+
+```bash
+python generate_confidence_colored_ply.py --ply "output/your_svo.ply" --conf "output/your_svo_confidence.npy"
+```
+
+输出：白=高置信度，灰=低置信度的彩色 PLY 文件。
+
+### 2. Open3D 交互式查看器
+
+```bash
+# 仅加载点云（无置信度数据时使用均匀置信度）
+python open3d_conf_viewer.py --ply "output/your_svo.ply"
+
+# 带置信度数据
+python open3d_conf_viewer.py --ply "output/your_svo.ply" --conf "output/your_svo_confidence.npy"
+```
+
+操作：按 `Q/E` 调节置信度阈值，实时过滤低置信度点。
+
+### 3. Gradio Web 界面
+
+```bash
+python confidence_slider_app.py --svo "path/to/video.svo2"
+```
+
+启动后浏览器打开 `http://localhost:7860`，可拖动滑块实时预览不同置信度阈值下的滤波效果。
 
 ## 中间滤波结果
 
@@ -88,15 +125,17 @@ output/
 ├── your_svo_03_statistical.ply      # 统计滤波后
 ├── your_svo_04_radius.ply           # 半径滤波后
 ├── your_svo_05_dbscan.ply           # DBSCAN聚类后
-└── your_svo.ply                     # 最终结果
+├── your_svo.ply                     # 最终结果
+└── your_svo_confidence.npy          # 置信度数据（用于可视化与交互式滤波）
 ```
 
 ## 技术原理
 
-1. **深度估计**：使用 Fast-FoundationStereo 零样本立体匹配模型，从左右目图像对估计深度图
-2. **坐标转换**：`depth2xyzmap` 产生的 OpenCV 坐标系 (X→右, Y↓, Z→前) 需转换为 ZED 的 RIGHT_HANDED_Y_UP 坐标系
-3. **点云融合**：使用 ZED 位姿矩阵将每帧点云从相机坐标系转换到世界坐标系
-4. **滤波策略**：先时序过滤（去除单视角噪声），再空间滤波（保留主要结构）
+1. **深度估计**：使用 Fast-FoundationStereo 零样本立体匹配模型，从左右目图像对估计**深度图与置信度图**
+2. **置信度分析**：Foundation Stereo 输出的置信度反映每个像素深度估计的可靠性，用于指导后续滤波
+3. **坐标转换**：`depth2xyzmap` 产生的 OpenCV 坐标系 (X→右, Y↓, Z→前) 需转换为 ZED 的 RIGHT_HANDED_Y_UP 坐标系
+4. **点云融合**：使用 ZED 位姿矩阵将每帧点云从相机坐标系转换到世界坐标系
+5. **滤波策略**：先时序过滤（去除单视角噪声），再空间滤波（保留主要结构）
 
 ## 参考
 
