@@ -193,19 +193,84 @@ class FFSInference:
         model.args.max_disp = cfg.get('max_disp', 192)
         self.model = model.to(device).eval()
         self.cfg = cfg
+        self.left_img_cache = None
+        self.right_img_cache = None
         logging.info("FFS model loaded successfully")
+
+    @torch.no_grad()
+    def compute_confidence_lr_consistency(self, left_img: np.ndarray, right_img: np.ndarray,
+                                          scale: float = 0.5, valid_iters: int = 8) -> np.ndarray:
+        """
+        Compute confidence based on left-right consistency check.
+        Returns confidence map where higher values = more reliable.
+
+        Method:
+        1. Run inference on left-right pair to get disparity
+        2. Run inference on right-left pair (swapped) to get right disparity
+        3. Reproject right disparity to left view and compare
+        4. Low consistency error -> High confidence
+        """
+        if scale != 1.0:
+            left_img = cv2.resize(left_img, fx=scale, fy=scale, dsize=None)
+            right_img = cv2.resize(right_img, fx=scale, fy=scale, dsize=None)
+
+        H, W = left_img.shape[:2]
+
+        img0 = torch.as_tensor(left_img).to(self.device).float()[None].permute(0, 3, 1, 2)
+        img1 = torch.as_tensor(right_img).to(self.device).float()[None].permute(0, 3, 1, 2)
+        padder = InputPadder(img0.shape, divis_by=32, force_square=False)
+        img0, img1 = padder.pad(img0, img1)
+
+        with torch.amp.autocast('cuda', enabled=True, dtype=AMP_DTYPE):
+            disp_lr = self.model.forward(img0, img1, iters=valid_iters,
+                                          test_mode=True, optimize_build_volume='pytorch1')
+            disp_rl = self.model.forward(img1, img0, iters=valid_iters,
+                                          test_mode=True, optimize_build_volume='pytorch1')
+
+        disp_lr = padder.unpad(disp_lr.float()).cpu().numpy().reshape(H, W)
+        disp_rl = padder.unpad(disp_rl.float()).cpu().numpy().reshape(H, W)
+
+        yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')
+
+        conf = np.zeros((H, W), dtype=np.float32)
+
+        for y in range(H):
+            for x in range(W):
+                d = disp_lr[y, x]
+                if d <= 0 or np.isinf(d):
+                    conf[y, x] = 0.0
+                    continue
+
+                x_reproj = int(x - d)
+                if x_reproj < 0 or x_reproj >= W:
+                    conf[y, x] = 0.0
+                    continue
+
+                d_reproj = disp_rl[y, x_reproj]
+                if d_reproj <= 0 or np.isinf(d_reproj):
+                    conf[y, x] = 0.0
+                    continue
+
+                error = abs(d - d_reproj)
+                conf[y, x] = np.exp(-error / 2.0)
+
+        return conf
 
     @torch.no_grad()
     def infer(self, left_img: np.ndarray, right_img: np.ndarray,
               scale: float = 0.5, valid_iters: int = 8,
               min_depth: float = 0.5, max_depth: float = 15.0,
-              depth_edge_threshold: float = 0.1) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+              depth_edge_threshold: float = 0.1,
+              compute_confidence: bool = False,
+              conf_temperature: float = 0.5) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
-        Returns: (disparity, depth, xyz_map_in_camera_coords)
+        Returns: (disparity, depth, xyz_map_in_camera_coords, confidence)
+                 confidence is all ones if compute_confidence=False
 
         Filtering:
         1. Removes points outside min_depth..max_depth range
         2. Removes points at depth discontinuities (object edges)
+        3. Removes points with low confidence (if compute_confidence=True)
         """
         if scale != 1.0:
             left_img = cv2.resize(left_img, fx=scale, fy=scale, dsize=None)
@@ -221,8 +286,31 @@ class FFSInference:
         with torch.amp.autocast('cuda', enabled=True, dtype=AMP_DTYPE):
             disp = self.model.forward(img0, img1, iters=valid_iters,
                                        test_mode=True, optimize_build_volume='pytorch1')
-        disp = padder.unpad(disp.float())
-        disp = disp.data.cpu().numpy().reshape(H, W)
+            if compute_confidence:
+                disp_rl = self.model.forward(img1, img0, iters=valid_iters,
+                                             test_mode=True, optimize_build_volume='pytorch1')
+        disp = padder.unpad(disp.float()).cpu().numpy().reshape(H, W)
+
+        confidence = np.ones((H, W), dtype=np.float32)
+        if compute_confidence:
+            disp_rl = padder.unpad(disp_rl.float()).cpu().numpy().reshape(H, W)
+            yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')
+            x_reproj = (xx - disp).astype(np.int32)
+            valid_reproj_mask = (x_reproj >= 0) & (x_reproj < W)
+            conf = np.zeros((H, W), dtype=np.float32)
+            for y in range(H):
+                for x in range(W):
+                    if not valid_reproj_mask[y, x]:
+                        conf[y, x] = 0.0
+                        continue
+                    d = disp[y, x]
+                    d_reproj = disp_rl[y, x_reproj[y, x]]
+                    if d <= 0 or d_reproj <= 0 or np.isinf(d) or np.isinf(d_reproj):
+                        conf[y, x] = 0.0
+                        continue
+                    error = abs(d - d_reproj)
+                    conf[y, x] = np.exp(-error / conf_temperature)
+            confidence = conf
 
         yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')
         us_right = xx - disp
@@ -257,7 +345,8 @@ class FFSInference:
         depth[combined_invalid] = 0
 
         xyz_map = depth2xyzmap(depth, K_scaled)
-        return disp, depth, xyz_map
+
+        return disp, depth, xyz_map, confidence
 
 
 import yaml
@@ -276,7 +365,9 @@ class PointCloudFuser:
                  temporal_warmup_frames: int = 5,
                  temporal_min_half_frames: int = 2,
                  skip_dbscan: bool = False,
-                 minimal_filtering: bool = False):
+                 minimal_filtering: bool = False,
+                 conf_threshold: float = 0.0,
+                 use_confidence_filter: bool = False):
         self.voxel_size = voxel_size
         self.nb_neighbors = nb_neighbors
         self.std_ratio = std_ratio
@@ -294,12 +385,16 @@ class PointCloudFuser:
         self.temporal_min_half_frames = temporal_min_half_frames
         self.skip_dbscan = skip_dbscan
         self.minimal_filtering = minimal_filtering
+        self.conf_threshold = conf_threshold
+        self.use_confidence_filter = use_confidence_filter
         self.all_points = []
         self.all_colors = []
         self.bin_temporal = {}
+        self.all_confidence = []
 
     def add_frame(self, xyz_map: np.ndarray, color_img: np.ndarray,
-                  pose_4x4: np.ndarray, valid_depth_range: Tuple[float, float] = (0.1, 100.0)):
+                  pose_4x4: np.ndarray, valid_depth_range: Tuple[float, float] = (0.1, 100.0),
+                  confidence: np.ndarray = None):
         """Transform camera-frame points to world frame and accumulate
 
         Coordinate systems:
@@ -309,10 +404,13 @@ class PointCloudFuser:
         """
         points = xyz_map.reshape(-1, 3)
         colors = color_img.reshape(-1, 3)
+        conf_flat = confidence.reshape(-1) if confidence is not None else np.ones(len(points))
 
         valid_mask = (points[:, 2] > valid_depth_range[0]) & (points[:, 2] < valid_depth_range[1])
+
         points = points[valid_mask]
         colors = colors[valid_mask]
+        conf_flat = conf_flat[valid_mask]
 
         if len(points) == 0:
             return
@@ -335,6 +433,7 @@ class PointCloudFuser:
 
         self.all_points.append(pts_world)
         self.all_colors.append(colors)
+        self.all_confidence.append(conf_flat)
 
         bin_size = self.voxel_size * self.sparse_bin_factor
         bin_keys = ((pts_world[:, 0] / bin_size).astype(np.int64) |
@@ -359,6 +458,7 @@ class PointCloudFuser:
 
         all_pts = np.vstack(self.all_points)
         all_clr = np.vstack(self.all_colors)
+        all_conf = np.concatenate(self.all_confidence) if self.all_confidence else np.ones(len(all_pts))
         logging.info(f"Fusing {len(all_pts)} raw points from {len(self.all_points)} frames")
 
         bin_size = self.voxel_size * self.sparse_bin_factor
@@ -370,6 +470,7 @@ class PointCloudFuser:
         keep_mask = np.array([k in valid_bins for k in keys])
         all_pts = all_pts[keep_mask]
         all_clr = all_clr[keep_mask]
+        all_conf = all_conf[keep_mask]
         logging.info(f"Sparse filter: removed {(~keep_mask).sum()} noise points, kept {len(all_pts)}")
 
         # Save after sparse filter
@@ -415,6 +516,7 @@ class PointCloudFuser:
         pts_temporal_removed = (~temporal_keep_mask).sum()
         all_pts = all_pts[temporal_keep_mask]
         all_clr = all_clr[temporal_keep_mask]
+        all_conf = all_conf[temporal_keep_mask]
         logging.info(f"Temporal filter (warmup={self.temporal_warmup_frames}, min_half={self.temporal_min_half_frames}): removed {pts_temporal_removed} noise points, kept {len(all_pts)}")
 
         # Save after temporal filter
@@ -432,59 +534,12 @@ class PointCloudFuser:
             logging.info(f"Statistical outlier removal (k={self.nb_neighbors}, std={self.std_ratio}): {after_voxel} -> {after_stat}")
             save_intermediate(pcd, 'statistical', 3)
 
-            cl, ind = pcd.remove_radius_outlier(nb_points=self.radius_nb_points,
+            pcd, ind_radius = pcd.remove_radius_outlier(nb_points=self.radius_nb_points,
                                                 radius=self.radius_radius)
-            pcd = cl
+            all_conf = all_conf[ind_radius] if len(ind_radius) == len(all_conf) else all_conf
             after_radius = len(pcd.points)
             logging.info(f"Radius outlier removal (nb={self.radius_nb_points}, r={self.radius_radius}): {after_stat} -> {after_radius}")
             save_intermediate(pcd, 'radius', 4)
-
-            with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error):
-                labels = np.array(pcd.cluster_dbscan(eps=self.dbscan_eps,
-                                                      min_points=self.dbscan_min_pts,
-                                                      print_progress=False))
-            if len(labels) > 0:
-                max_label = labels.max()
-                cluster_sizes = [(labels == i).sum() for i in range(max_label + 1)]
-                valid_mask = labels >= 0
-                for i, sz in enumerate(cluster_sizes):
-                    if sz < self.dbscan_min_pts:
-                        valid_mask[labels == i] = False
-                pcd = pcd.select_by_index(np.where(valid_mask)[0])
-                after_dbscan = len(pcd.points)
-                logging.info(f"DBSCAN clustering (eps={self.dbscan_eps}, min_pts={self.dbscan_min_pts}): {after_radius} -> {after_dbscan} (kept {max_label+1} clusters)")
-            else:
-                logging.warning("DBSCAN returned no labels, skipping cluster filter")
-                after_dbscan = after_radius
-            save_intermediate(pcd, 'dbscan', 5)
-            after_cone = after_dbscan
-        else:
-            pcd = pcd_temporal
-            orig_len = len(pcd.points)
-
-            pcd = pcd.voxel_down_sample(voxel_size=self.voxel_size)
-            after_voxel = len(pcd.points)
-            logging.info(f"Voxel downsample: {orig_len} -> {after_voxel}")
-
-            # Save after voxel downsample
-            save_intermediate(pcd, 'voxel', 3)
-
-            pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=self.nb_neighbors,
-                                                    std_ratio=self.std_ratio)
-            after_stat = len(pcd.points)
-            logging.info(f"Statistical outlier removal (k={self.nb_neighbors}, std={self.std_ratio}): {after_voxel} -> {after_stat}")
-
-            # Save after statistical outlier removal
-            save_intermediate(pcd, 'statistical', 4)
-
-            cl, ind = pcd.remove_radius_outlier(nb_points=self.radius_nb_points,
-                                                radius=self.radius_radius)
-            pcd = cl
-            after_radius = len(pcd.points)
-            logging.info(f"Radius outlier removal (nb={self.radius_nb_points}, r={self.radius_radius}): {after_stat} -> {after_radius}")
-
-            # Save after radius outlier removal
-            save_intermediate(pcd, 'radius', 5)
 
             if self.skip_dbscan:
                 logging.info("DBSCAN skipped by user")
@@ -501,7 +556,56 @@ class PointCloudFuser:
                     for i, sz in enumerate(cluster_sizes):
                         if sz < self.dbscan_min_pts:
                             valid_mask[labels == i] = False
-                    pcd = pcd.select_by_index(np.where(valid_mask)[0])
+                    valid_indices = np.where(valid_mask)[0]
+                    pcd = pcd.select_by_index(valid_indices)
+                    all_conf = all_conf[valid_indices] if len(valid_indices) <= len(all_conf) else all_conf
+                    after_dbscan = len(pcd.points)
+                    logging.info(f"DBSCAN clustering (eps={self.dbscan_eps}, min_pts={self.dbscan_min_pts}): {after_radius} -> {after_dbscan} (kept {max_label+1} clusters)")
+                else:
+                    logging.warning("DBSCAN returned no labels, skipping cluster filter")
+                    after_dbscan = after_radius
+            save_intermediate(pcd, 'dbscan', 5)
+            after_cone = after_dbscan
+        else:
+            pcd = pcd_temporal
+            orig_len = len(pcd.points)
+
+            pcd, ind_stat = pcd.remove_statistical_outlier(nb_neighbors=self.nb_neighbors,
+                                                    std_ratio=self.std_ratio)
+            all_conf = all_conf[ind_stat] if len(ind_stat) == len(all_conf) else all_conf
+            after_stat = len(pcd.points)
+            logging.info(f"Statistical outlier removal (k={self.nb_neighbors}, std={self.std_ratio}): {orig_len} -> {after_stat}")
+
+            # Save after statistical outlier removal
+            save_intermediate(pcd, 'statistical', 3)
+
+            pcd, ind_radius = pcd.remove_radius_outlier(nb_points=self.radius_nb_points,
+                                                radius=self.radius_radius)
+            all_conf = all_conf[ind_radius] if len(ind_radius) == len(all_conf) else all_conf
+            after_radius = len(pcd.points)
+            logging.info(f"Radius outlier removal (nb={self.radius_nb_points}, r={self.radius_radius}): {after_stat} -> {after_radius}")
+
+            # Save after radius outlier removal
+            save_intermediate(pcd, 'radius', 4)
+
+            if self.skip_dbscan:
+                logging.info("DBSCAN skipped by user")
+                after_dbscan = after_radius
+            else:
+                with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error):
+                    labels = np.array(pcd.cluster_dbscan(eps=self.dbscan_eps,
+                                                          min_points=self.dbscan_min_pts,
+                                                          print_progress=False))
+                if len(labels) > 0:
+                    max_label = labels.max()
+                    cluster_sizes = [(labels == i).sum() for i in range(max_label + 1)]
+                    valid_mask = labels >= 0
+                    for i, sz in enumerate(cluster_sizes):
+                        if sz < self.dbscan_min_pts:
+                            valid_mask[labels == i] = False
+                    valid_indices = np.where(valid_mask)[0]
+                    pcd = pcd.select_by_index(valid_indices)
+                    all_conf = all_conf[valid_indices] if len(valid_indices) <= len(all_conf) else all_conf
                     after_dbscan = len(pcd.points)
                     logging.info(f"DBSCAN clustering (eps={self.dbscan_eps}, min_pts={self.dbscan_min_pts}): {after_radius} -> {after_dbscan} (kept {max_label+1} clusters)")
                 else:
@@ -509,21 +613,37 @@ class PointCloudFuser:
                     after_dbscan = after_radius
 
             # Save after DBSCAN clustering
-            save_intermediate(pcd, 'dbscan', 6)
+            save_intermediate(pcd, 'dbscan', 5)
 
             pts = np.asarray(pcd.points)
             valid_mask = self._detect_conical_artifacts(pts)
             removed_cone = (~valid_mask).sum()
-            pcd = pcd.select_by_index(np.where(valid_mask)[0])
+            valid_indices = np.where(valid_mask)[0]
+            pcd = pcd.select_by_index(valid_indices)
+            all_conf = all_conf[valid_indices] if len(valid_indices) <= len(all_conf) else all_conf
             after_cone = len(pcd.points)
             logging.info(f"Conical artifact removal (theta={self.cone_n_theta}, phi={self.cone_n_phi}, ratio={self.cone_count_ratio}): {after_dbscan} -> {after_cone} (removed {removed_cone})")
 
             # Save after conical artifact removal (final intermediate)
-            save_intermediate(pcd, 'conical', 7)
+            save_intermediate(pcd, 'conical', 6)
+
+            pcd = pcd.voxel_down_sample(voxel_size=self.voxel_size)
+            after_voxel = len(pcd.points)
+            logging.info(f"Voxel downsample: {after_cone} -> {after_voxel}")
+
+            # Save after voxel downsample (final)
+            save_intermediate(pcd, 'voxel', 7)
 
         o3d.io.write_point_cloud(output_path, pcd)
+        final_pts = len(pcd.points)
+        if len(all_conf) != final_pts:
+            logging.warning(f"Confidence array size ({len(all_conf)}) != points size ({final_pts}). Truncating confidence to match.")
+            all_conf = all_conf[:final_pts]
+        conf_output_path = output_path.replace('.ply', '_confidence.npy')
+        np.save(conf_output_path, all_conf)
         logging.info(f"Saved: {output_path}")
-        logging.info(f"Final point cloud: {len(pcd.points)} points")
+        logging.info(f"Saved confidence: {conf_output_path}")
+        logging.info(f"Final point cloud: {final_pts} points")
         return pcd
 
     def _detect_conical_artifacts(self, points: np.ndarray) -> np.ndarray:
@@ -574,6 +694,24 @@ class PointCloudFuser:
                 valid[idx] = False
 
         return valid
+
+    @staticmethod
+    def filter_by_confidence(points, colors, confidence, conf_threshold):
+        """Filter points by confidence threshold.
+
+        Args:
+            points: (N, 3) array of 3D points
+            colors: (N, 3) array of RGB colors
+            confidence: (N,) array of confidence values
+            conf_threshold: minimum confidence value to keep
+
+        Returns:
+            filtered_points, filtered_colors
+        """
+        if confidence is None:
+            return points, colors
+        valid_mask = confidence > conf_threshold
+        return points[valid_mask], colors[valid_mask]
 
 
 def main():
@@ -640,6 +778,10 @@ Examples:
                        help='Conical detection inner/outer count ratio threshold (default: 3.0)')
     parser.add_argument('--cone_discard_outer_ratio', type=float, default=0.5,
                        help='Fraction of outer theta bins to check for conical artifacts (default: 0.5)')
+    parser.add_argument('--conf_threshold', type=float, default=0.0,
+                       help='Confidence threshold for filtering low-quality points (default: 0.0, meaning no filtering)')
+    parser.add_argument('--use_confidence_filter', action='store_true',
+                       help='Enable confidence-based filtering (requires confidence computation)')
     args = parser.parse_args()
 
     set_logging_format()
@@ -687,22 +829,26 @@ Examples:
                 temporal_min_half_frames=args.temporal_min_half_frames,
                 skip_dbscan=args.skip_dbscan,
                 minimal_filtering=args.minimal_filtering,
+                conf_threshold=args.conf_threshold,
+                use_confidence_filter=args.use_confidence_filter,
             )
 
             gen = reader.stream_frames(frame_skip=args.frame_skip, max_ok_frames=args.max_ok_frames)
             for idx, (left, right, pose) in enumerate(gen):
                 t_frame = time.time()
-                disp, depth, xyz = ffs.infer(left, right, scale=args.scale,
+                disp, depth, xyz, conf = ffs.infer(left, right, scale=args.scale,
                                              valid_iters=args.valid_iters,
                                              min_depth=args.min_depth,
                                              max_depth=args.max_depth,
-                                             depth_edge_threshold=args.depth_edge_threshold)
+                                             depth_edge_threshold=args.depth_edge_threshold,
+                                             compute_confidence=args.use_confidence_filter)
                 if args.scale != 1.0:
                     left_scaled = cv2.resize(left, fx=args.scale, fy=args.scale, dsize=None)
                 else:
                     left_scaled = left
                 fuser.add_frame(xyz, left_scaled, pose,
-                                valid_depth_range=(args.min_depth, args.max_depth))
+                                valid_depth_range=(args.min_depth, args.max_depth),
+                                confidence=conf if args.use_confidence_filter else None)
                 dt = time.time() - t_frame
                 n_pts = (xyz.reshape(-1, 3)[:, 2] > 0.1).sum()
                 logging.info(f"Frame {idx}: {n_pts} pts, {dt:.2f}s")
@@ -727,3 +873,68 @@ Examples:
 
 if __name__ == "__main__":
     main()
+
+
+def filter_ply_by_confidence(ply_path, conf_threshold, output_path=None):
+    """Filter existing PLY file by confidence threshold.
+
+    This function loads a PLY file and filters points based on confidence values
+    that were saved alongside it (as *_confidence.npy).
+
+    Args:
+        ply_path: Path to input PLY file
+        conf_threshold: Confidence threshold (points below this are removed)
+        output_path: Path to output PLY file (default: adds '_filtered' suffix)
+
+    Returns:
+        Filtered point cloud
+    """
+    import numpy as np
+    import open3d as o3d
+
+    conf_path = ply_path.replace('.ply', '_confidence.npy')
+    if not os.path.exists(conf_path):
+        logging.error(f"Confidence file not found: {conf_path}")
+        logging.error("Please run with --use_confidence_filter first to generate confidence data")
+        return None
+
+    logging.info(f"Loading PLY: {ply_path}")
+    pcd = o3d.io.read_point_cloud(ply_path)
+    points = np.asarray(pcd.points)
+    colors = np.asarray(pcd.colors)
+    confidence = np.load(conf_path)
+
+    logging.info(f"Loaded {len(points)} points, confidence range: [{confidence.min():.4f}, {confidence.max():.4f}]")
+
+    valid_mask = confidence > conf_threshold
+    filtered_points = points[valid_mask]
+    filtered_colors = colors[valid_mask] if len(colors) > 0 else None
+
+    logging.info(f"Confidence filter (threshold={conf_threshold:.4f}): {valid_mask.sum()}/{len(points)} points kept ({valid_mask.mean()*100:.1f}%)")
+
+    filtered_pcd = o3d.geometry.PointCloud()
+    filtered_pcd.points = o3d.utility.Vector3dVector(filtered_points)
+    if filtered_colors is not None:
+        filtered_pcd.colors = o3d.utility.Vector3dVector(filtered_colors)
+
+    if output_path is None:
+        name = os.path.splitext(os.path.basename(ply_path))[0]
+        dir_name = os.path.dirname(ply_path)
+        output_path = os.path.join(dir_name, f"{name}_conf{conf_threshold:.2f}.ply")
+
+    o3d.io.write_point_cloud(output_path, filtered_pcd)
+    logging.info(f"Saved filtered PLY: {output_path}")
+
+    return filtered_pcd
+
+
+if __name__ == "__filter__":
+    import argparse
+    parser = argparse.ArgumentParser(description='Filter PLY by confidence')
+    parser.add_argument('--ply', type=str, required=True, help='Input PLY file')
+    parser.add_argument('--threshold', type=float, default=0.1, help='Confidence threshold')
+    parser.add_argument('--output', type=str, default=None, help='Output PLY file')
+    args = parser.parse_args()
+
+    set_logging_format()
+    filter_ply_by_confidence(args.ply, args.threshold, args.output)
